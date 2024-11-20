@@ -3,6 +3,9 @@ package image
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
@@ -23,8 +26,10 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
-	"github.com/lxc/incus/v6/client"
+	incus "github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/shared/api"
+	"github.com/lxc/incus/v6/shared/archive"
+	"github.com/lxc/incus/v6/shared/subprocess"
 
 	"github.com/lxc/terraform-provider-incus/internal/errors"
 	provider_config "github.com/lxc/terraform-provider-incus/internal/provider-config"
@@ -33,6 +38,7 @@ import (
 
 // ImageModel resource data model that matches the schema.
 type ImageModel struct {
+	SourceFile     types.Object `tfsdk:"source_file"`
 	SourceImage    types.Object `tfsdk:"source_image"`
 	SourceInstance types.Object `tfsdk:"source_instance"`
 	Aliases        types.Set    `tfsdk:"aliases"`
@@ -44,6 +50,11 @@ type ImageModel struct {
 	CreatedAt     types.Int64  `tfsdk:"created_at"`
 	Fingerprint   types.String `tfsdk:"fingerprint"`
 	CopiedAliases types.Set    `tfsdk:"copied_aliases"`
+}
+
+type SourceFileModel struct {
+	DataPath     types.String `tfsdk:"data_path"`
+	MetadataPath types.String `tfsdk:"metadata_path"`
 }
 
 type SourceImageModel struct {
@@ -76,6 +87,18 @@ func (r ImageResource) Metadata(_ context.Context, req resource.MetadataRequest,
 func (r ImageResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Attributes: map[string]schema.Attribute{
+			"source_file": schema.SingleNestedAttribute{
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"data_path": schema.StringAttribute{
+						Required: true,
+					},
+					"metadata_path": schema.StringAttribute{
+						Optional: true,
+					},
+				},
+			},
+
 			"source_image": schema.SingleNestedAttribute{
 				Optional: true,
 				Attributes: map[string]schema.Attribute{
@@ -222,18 +245,10 @@ func (r ImageResource) ValidateConfig(ctx context.Context, req resource.Validate
 		return
 	}
 
-	if config.SourceImage.IsNull() && config.SourceInstance.IsNull() {
+	if !exactlyOne(!config.SourceFile.IsNull(), !config.SourceImage.IsNull(), !config.SourceInstance.IsNull()) {
 		resp.Diagnostics.AddError(
 			"Invalid Configuration",
-			"Either source_image or source_instance must be set.",
-		)
-		return
-	}
-
-	if !config.SourceImage.IsNull() && !config.SourceInstance.IsNull() {
-		resp.Diagnostics.AddError(
-			"Invalid Configuration",
-			"Only source_image or source_instance can be set.",
+			"Exactly one of source_file, source_image or source_instance must be set.",
 		)
 		return
 	}
@@ -248,7 +263,10 @@ func (r ImageResource) Create(ctx context.Context, req resource.CreateRequest, r
 		return
 	}
 
-	if !plan.SourceImage.IsNull() {
+	if !plan.SourceFile.IsNull() {
+		r.createImageFromSourceFile(ctx, resp, &plan)
+		return
+	} else if !plan.SourceImage.IsNull() {
 		r.createImageFromSourceImage(ctx, resp, &plan)
 		return
 	} else if !plan.SourceInstance.IsNull() {
@@ -442,6 +460,169 @@ func (r ImageResource) SyncState(ctx context.Context, tfState *tfsdk.State, serv
 	}
 
 	return tfState.Set(ctx, &m)
+}
+
+func (r ImageResource) createImageFromSourceFile(ctx context.Context, resp *resource.CreateResponse, plan *ImageModel) {
+	var sourceFileModel SourceFileModel
+
+	diags := plan.SourceFile.As(ctx, &sourceFileModel, basetypes.ObjectAsOptions{})
+	if diags.HasError() {
+		resp.Diagnostics.Append(diags...)
+		return
+	}
+
+	remote := plan.Remote.ValueString()
+	project := plan.Project.ValueString()
+	server, err := r.provider.InstanceServer(remote, project, "")
+	if err != nil {
+		resp.Diagnostics.Append(errors.NewInstanceServerError(err))
+		return
+	}
+
+	var dataPath, metadataPath string
+	if sourceFileModel.MetadataPath.IsNull() {
+		// Unified image
+		metadataPath = sourceFileModel.DataPath.ValueString()
+	} else {
+		// Split image
+		dataPath = sourceFileModel.DataPath.ValueString()
+		metadataPath = sourceFileModel.MetadataPath.ValueString()
+	}
+
+	var image api.ImagesPost
+	var createArgs *incus.ImageCreateArgs
+
+	imageType := "container"
+	// TODO: should https urls also be supported?
+	if strings.HasPrefix(dataPath, "https://") {
+		image.Source = &api.ImagesPostSource{}
+		image.Source.Type = "url"
+		image.Source.Mode = "pull"
+		image.Source.Protocol = "direct"
+		image.Source.URL = dataPath
+		createArgs = nil
+	} else {
+		var meta io.ReadCloser
+		var rootfs io.ReadCloser
+
+		// Open meta
+		if utils.IsDir(metadataPath) {
+			metadataPath, err = packImageDir(metadataPath)
+			if err != nil {
+				resp.Diagnostics.AddError(fmt.Sprintf("Failed to pack metadata_path: %s", metadataPath), err.Error())
+				return
+			}
+			// remove temp file
+			defer func() { _ = os.Remove(metadataPath) }()
+		}
+
+		meta, err = os.Open(metadataPath)
+		if err != nil {
+			resp.Diagnostics.AddError(fmt.Sprintf("Failed to open metadata_path: %s", metadataPath), err.Error())
+			return
+		}
+
+		defer func() { _ = meta.Close() }()
+
+		// Open rootfs
+		if dataPath != "" {
+			rootfs, err = os.Open(dataPath)
+			if err != nil {
+				resp.Diagnostics.AddError(fmt.Sprintf("failed to open data_path: %s", dataPath), err.Error())
+				return
+			}
+
+			defer func() { _ = rootfs.Close() }()
+
+			_, ext, _, err := archive.DetectCompressionFile(rootfs)
+			if err != nil {
+				resp.Diagnostics.AddError(fmt.Sprintf("Failed to detect compression of rootfs in data_path: %s", dataPath), err.Error())
+				return
+			}
+
+			_, err = rootfs.(*os.File).Seek(0, io.SeekStart)
+			if err != nil {
+				resp.Diagnostics.AddError(fmt.Sprintf("Failed to seek start for rootfas in data_path: %s", dataPath), err.Error())
+				return
+			}
+
+			if ext == ".qcow2" {
+				imageType = "virtual-machine"
+			}
+		}
+
+		createArgs = &incus.ImageCreateArgs{
+			MetaFile:   meta,
+			MetaName:   filepath.Base(metadataPath),
+			RootfsFile: rootfs,
+			RootfsName: filepath.Base(dataPath),
+			Type:       imageType,
+		}
+
+		image.Filename = createArgs.MetaName
+	}
+
+	aliases, diags := ToAliasList(ctx, plan.Aliases)
+	if diags.HasError() {
+		resp.Diagnostics.Append(diags...)
+		return
+	}
+
+	// NOTE: this does not seem to have an effect
+	// imageAliases := make([]api.ImageAlias, 0, len(aliases))
+	// for _, alias := range aliases {
+	// 	// Ensure image alias does not already exist.
+	// 	aliasTarget, _, _ := server.GetImageAlias(alias)
+	// 	if aliasTarget != nil {
+	// 		resp.Diagnostics.AddError(fmt.Sprintf("Image alias %q already exists", alias), "")
+	// 		return
+	// 	}
+
+	// 	ia := api.ImageAlias{
+	// 		Name: alias,
+	// 	}
+
+	// 	imageAliases = append(imageAliases, ia)
+	// }
+	// image.Aliases = imageAliases
+
+	op, err := server.CreateImage(image, createArgs)
+	if err != nil {
+		resp.Diagnostics.AddError(fmt.Sprintf("Failed to create image from file %q", dataPath), err.Error())
+		return
+	}
+
+	// Wait for image create operation to finish.
+	err = op.Wait()
+	if err != nil {
+		resp.Diagnostics.AddError(fmt.Sprintf("Failed to create image from file %q", dataPath), err.Error())
+		return
+	}
+
+	fingerprint, ok := op.Get().Metadata["fingerprint"].(string)
+	if !ok {
+		resp.Diagnostics.AddError("Failed to get fingerprint of created image", "no fingerprint returned in metadata")
+		return
+	}
+	imageID := createImageResourceID(remote, fingerprint)
+	plan.ResourceID = types.StringValue(imageID)
+
+	plan.CopiedAliases = basetypes.NewSetNull(basetypes.StringType{})
+
+	// Create new aliases.
+	for _, alias := range aliases {
+		aliasPost := api.ImageAliasesPost{}
+		aliasPost.Name = alias
+		aliasPost.Target = fingerprint
+		err := server.CreateImageAlias(aliasPost)
+		if err != nil {
+			resp.Diagnostics.AddError(fmt.Sprintf("Failed to create alias: %s: ", alias), err.Error())
+			return
+		}
+	}
+
+	diags = r.SyncState(ctx, &resp.State, server, *plan)
+	resp.Diagnostics.Append(diags...)
 }
 
 func (r ImageResource) createImageFromSourceImage(ctx context.Context, resp *resource.CreateResponse, plan *ImageModel) {
@@ -727,4 +908,39 @@ func createImageResourceID(remote string, fingerprint string) string {
 func splitImageResourceID(id string) (string, string) {
 	pieces := strings.SplitN(id, ":", 2)
 	return pieces[0], pieces[1]
+}
+
+func exactlyOne(in ...bool) bool {
+	var count int
+	for _, b := range in {
+		if b {
+			count++
+		}
+	}
+	return count == 1
+}
+
+func packImageDir(path string) (string, error) {
+	// Quick checks.
+	if os.Geteuid() == -1 {
+		return "", fmt.Errorf("directory import is not available on this platform")
+	}
+	if os.Geteuid() != 0 {
+		return "", fmt.Errorf("must run as root to import from directory")
+	}
+
+	outFile, err := os.CreateTemp("", "incus_image_")
+	if err != nil {
+		return "", err
+	}
+
+	defer func() { _ = outFile.Close() }()
+
+	outFileName := outFile.Name()
+	_, err = subprocess.RunCommand("tar", "-C", path, "--numeric-owner", "--restrict", "--force-local", "--xattrs", "-cJf", outFileName, "rootfs", "templates", "metadata.yaml")
+	if err != nil {
+		return "", err
+	}
+
+	return outFileName, outFile.Close()
 }
