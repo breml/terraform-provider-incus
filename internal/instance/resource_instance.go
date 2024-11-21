@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -27,8 +28,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
-	"github.com/lxc/incus/v6/client"
+	incus "github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/shared/api"
+	"github.com/mitchellh/go-homedir"
 
 	"github.com/lxc/terraform-provider-incus/internal/common"
 	"github.com/lxc/terraform-provider-incus/internal/errors"
@@ -53,6 +55,7 @@ type InstanceModel struct {
 	Remote         types.String `tfsdk:"remote"`
 	Target         types.String `tfsdk:"target"`
 	SourceInstance types.Object `tfsdk:"source_instance"`
+	SourceFile     types.String `tfsdk:"source_file"`
 
 	// Computed.
 	IPv4   types.String `tfsdk:"ipv4_address"`
@@ -202,6 +205,16 @@ func (r InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				},
 				PlanModifiers: []planmodifier.Object{
 					objectplanmodifier.RequiresReplace(),
+				},
+			},
+
+			"source_file": schema.StringAttribute{
+				Optional: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
 				},
 			},
 
@@ -371,12 +384,72 @@ func (r InstanceResource) ValidateConfig(ctx context.Context, req resource.Valid
 		)
 	}
 
-	if !config.Image.IsNull() && !config.SourceInstance.IsNull() {
+	if !atMostOne(!config.Image.IsNull(), !config.SourceFile.IsNull(), !config.SourceInstance.IsNull()) {
 		resp.Diagnostics.AddError(
 			"Invalid Configuration",
-			"Only image or source_instance can be set.",
+			"At most one of image, source_file and source_instance can be set.",
 		)
 		return
+	}
+
+	if !config.SourceFile.IsNull() {
+		// Instances from source_file are mutually exclusive with a series of other attributes.
+		if !config.Description.IsNull() ||
+			!config.Type.IsNull() ||
+			!config.Ephemeral.IsNull() ||
+			!config.Profiles.IsNull() ||
+			!config.Files.IsNull() ||
+			!config.Config.IsNull() {
+			resp.Diagnostics.AddError(
+				"Invalid Configuration",
+				"Attribute source_file is mutually exclusive with description, type, ephemeral, profiles, file and config.",
+			)
+			return
+		}
+
+		// With `incus import`, a storage pool can be provided optionally.
+		// In order to support the same behavior with source_file,
+		// a single device entry of type `disk` is allowed with a single property
+		// `pool` set to the respective pool name.
+		if len(config.Devices.Elements()) > 0 {
+			if len(config.Devices.Elements()) > 1 {
+				resp.Diagnostics.AddError(
+					"Invalid Configuration",
+					"Only one device entry is supported with source_file.",
+				)
+				return
+			}
+
+			deviceList := make([]common.DeviceModel, 0, 1)
+			diags = config.Devices.ElementsAs(ctx, &deviceList, false)
+			if diags.HasError() {
+				resp.Diagnostics.Append(diags...)
+				return
+			}
+
+			if len(deviceList[0].Properties.Elements()) != 1 {
+				resp.Diagnostics.AddError(
+					"Invalid Configuration",
+					`Exactly one device property named "pool" needs to be provided with source_file.`,
+				)
+				return
+			}
+
+			properties := make(map[string]string, 1)
+			diags = deviceList[0].Properties.ElementsAs(ctx, &properties, false)
+			if diags.HasError() {
+				resp.Diagnostics.Append(diags...)
+				return
+			}
+
+			if _, ok := properties["pool"]; !ok {
+				resp.Diagnostics.AddError(
+					"Invalid Configuration",
+					`Exactly one device property named "pool" needs to be provided with source_file.`,
+				)
+				return
+			}
+		}
 	}
 }
 
@@ -400,6 +473,9 @@ func (r InstanceResource) Create(ctx context.Context, req resource.CreateRequest
 
 	if !plan.Image.IsNull() {
 		diags = r.createInstanceFromImage(ctx, server, plan)
+		resp.Diagnostics.Append(diags...)
+	} else if !plan.SourceFile.IsNull() {
+		diags = r.createInstanceFromSourceFile(ctx, server, plan)
 		resp.Diagnostics.Append(diags...)
 	} else if !plan.SourceInstance.IsNull() {
 		diags = r.createInstanceFromSourceInstance(ctx, server, plan)
@@ -795,6 +871,13 @@ func (r InstanceResource) SyncState(ctx context.Context, tfState *tfsdk.State, s
 		return respDiags
 	}
 
+	if !m.SourceFile.IsNull() && !m.Devices.IsNull() {
+		// Using device to signal the storage poll is a special case, which is not
+		// reflected on the instance state and therefore we need to compensate here
+		// in order to prevent inconsistent provider results.
+		devices = m.Devices
+	}
+
 	m.Name = types.StringValue(instance.Name)
 	m.Type = types.StringValue(instance.Type)
 	m.Description = types.StringValue(instance.Description)
@@ -883,6 +966,66 @@ func (r InstanceResource) createInstanceFromImage(ctx context.Context, server in
 
 	if err != nil {
 		diags.AddError(fmt.Sprintf("Failed to create instance %q", instance.Name), err.Error())
+		return diags
+	}
+
+	return diags
+}
+
+func (r InstanceResource) createInstanceFromSourceFile(ctx context.Context, server incus.InstanceServer, plan InstanceModel) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	name := plan.Name.ValueString()
+
+	var poolName string
+
+	if len(plan.Devices.Elements()) > 0 {
+		// Only one device is expected, this is ensured by ValidateConfig.
+		deviceList := make([]common.DeviceModel, 0, 1)
+		diags = plan.Devices.ElementsAs(ctx, &deviceList, false)
+		if diags.HasError() {
+			return diags
+		}
+
+		// Exactly one property named "pool" is expected, this is ensured by ValidateConfig.
+		properties := make(map[string]string, 1)
+		diags = deviceList[0].Properties.ElementsAs(ctx, &properties, false)
+		if diags.HasError() {
+			return diags
+		}
+
+		poolName = properties["pool"]
+	}
+
+	srcFile := plan.SourceFile.ValueString()
+
+	path, err := homedir.Expand(srcFile)
+	if err != nil {
+		diags.AddError(fmt.Sprintf("Failed to determine source_file: %q", srcFile), err.Error())
+		return diags
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		diags.AddError(fmt.Sprintf("Failed to open source_file: %q", path), err.Error())
+		return diags
+	}
+
+	defer func() { _ = file.Close() }()
+
+	createArgs := incus.InstanceBackupArgs{
+		BackupFile: file,
+		PoolName:   poolName,
+		Name:       name,
+	}
+
+	op, err := server.CreateInstanceFromBackup(createArgs)
+	if err == nil {
+		err = op.Wait()
+	}
+
+	if err != nil {
+		diags.AddError(fmt.Sprintf("Failed to create instance: %q", name), err.Error())
 		return diags
 	}
 
@@ -1415,4 +1558,14 @@ func getAddresses(name string, entry api.InstanceStateNetwork) (string, string, 
 	}
 
 	return ipv4, ipv6, entry.Hwaddr, name, true
+}
+
+func atMostOne(in ...bool) bool {
+	var count int
+	for _, b := range in {
+		if b {
+			count++
+		}
+	}
+	return count <= 1
 }
