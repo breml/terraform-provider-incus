@@ -408,8 +408,8 @@ func (r InstanceResource) ValidateConfig(ctx context.Context, req resource.Valid
 
 		// With `incus import`, a storage pool can be provided optionally.
 		// In order to support the same behavior with source_file,
-		// a single device entry of type `disk` is allowed with a single property
-		// `pool` set to the respective pool name.
+		// a single device entry of type `disk` is allowed with exactly two properties
+		// `path` and `pool` being set. For `path`, the only accepted value is `/`.
 		if len(config.Devices.Elements()) > 0 {
 			if len(config.Devices.Elements()) > 1 {
 				resp.Diagnostics.AddError(
@@ -426,25 +426,28 @@ func (r InstanceResource) ValidateConfig(ctx context.Context, req resource.Valid
 				return
 			}
 
-			if len(deviceList[0].Properties.Elements()) != 1 {
+			if len(deviceList[0].Properties.Elements()) != 2 {
 				resp.Diagnostics.AddError(
 					"Invalid Configuration",
-					`Exactly one device property named "pool" needs to be provided with source_file.`,
+					`Exactly two device properties named "path" and "pool" need to be provided with source_file.`,
 				)
 				return
 			}
 
-			properties := make(map[string]string, 1)
+			properties := make(map[string]string, 2)
 			diags = deviceList[0].Properties.ElementsAs(ctx, &properties, false)
 			if diags.HasError() {
 				resp.Diagnostics.Append(diags...)
 				return
 			}
 
-			if _, ok := properties["pool"]; !ok {
+			_, poolOK := properties["pool"]
+			path, pathOK := properties["path"]
+
+			if !poolOK || !pathOK || path != "/" {
 				resp.Diagnostics.AddError(
 					"Invalid Configuration",
-					`Exactly one device property named "pool" needs to be provided with source_file.`,
+					`Exactly two device properties named "path" and "pool" need to be provided with source_file. For "path", the only accepted value is "/".`,
 				)
 				return
 			}
@@ -871,7 +874,7 @@ func (r InstanceResource) SyncState(ctx context.Context, tfState *tfsdk.State, s
 	}
 
 	if !m.SourceFile.IsNull() && !m.Devices.IsNull() {
-		// Using device to signal the storage poll is a special case, which is not
+		// Using device to signal the storage pool is a special case, which is not
 		// reflected on the instance state and therefore we need to compensate here
 		// in order to prevent inconsistent provider results.
 		devices = m.Devices
@@ -986,8 +989,8 @@ func (r InstanceResource) createInstanceFromSourceFile(ctx context.Context, serv
 			return diags
 		}
 
-		// Exactly one property named "pool" is expected, this is ensured by ValidateConfig.
-		properties := make(map[string]string, 1)
+		// Exactly two properties named "path" and "pool" are expected, this is ensured by ValidateConfig.
+		properties := make(map[string]string, 2)
 		diags = deviceList[0].Properties.ElementsAs(ctx, &properties, false)
 		if diags.HasError() {
 			return diags
