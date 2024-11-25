@@ -104,7 +104,7 @@ resource "incus_instance" "instance1" {
 In order to provide the storage pool name for an instance, which is created
 from a backup exactly one `device` configuration of `type = "disk"` might be
 provided. The name of the pool is given as the `pool` attribute in
-`properties`, which is the only property accepted in this case.
+`properties`. Additionally the property `path = "/"` is required.
 
 ```hcl
 resource "incus_instance" "instance1" {
@@ -116,6 +116,7 @@ resource "incus_instance" "instance1" {
     name = "storage"
     type = "disk"
     properties = {
+      path = "/"
       pool = "pool-name"
     }
   }

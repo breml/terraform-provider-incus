@@ -935,6 +935,7 @@ func TestAccInstance_sourceFileWithStorage(t *testing.T) {
 					resource.TestCheckResourceAttr("incus_instance.instance1", "device.#", "1"),
 					resource.TestCheckResourceAttr("incus_instance.instance1", "device.0.name", "storage"),
 					resource.TestCheckResourceAttr("incus_instance.instance1", "device.0.type", "disk"),
+					resource.TestCheckResourceAttr("incus_instance.instance1", "device.0.properties.path", "/"),
 					resource.TestCheckResourceAttr("incus_instance.instance1", "device.0.properties.pool", "default"),
 				),
 			},
@@ -1603,6 +1604,7 @@ resource "incus_instance" "instance1" {
     name = "storage"
     type = "disk"
     properties = {
+      "path" = "/"
       "pool" = "default"
     }
   }
